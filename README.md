@@ -2,6 +2,8 @@
 
 A suite of Databricks notebooks for comprehensive data observability across your lakehouse. Leverages Unity Catalog system tables to monitor costs, data quality, lineage, streaming health, and application logging.
 
+All data operations use the **PySpark DataFrame API** — there are no SQL cells. System table names are centralized in `notebooks/table_config.py` for easy environment configuration.
+
 ## Prerequisites
 
 - **Unity Catalog** enabled on your workspace
@@ -24,13 +26,13 @@ Enumerates all catalogs, schemas, tables, views, volumes, functions, and registe
 
 Tracks job costs, identifies the most expensive pipelines, and monitors retry/failure patterns.
 
-**Data sources:** `system.billing.usage`, `system.billing.list_prices`, `system.lakeflow.jobs`, `system.lakeflow.job_run_timeline`
+**Data sources:** `BILLING_USAGE`, `BILLING_LIST_PRICES`, `LAKEFLOW_JOBS`, `LAKEFLOW_JOB_RUN_TIMELINE` (from `table_config.py`)
 
 **Key outputs:**
 - 7-day and 14-day rolling spend with growth rate percentages
 - Top 25 most expensive jobs over the last 30 days
 - Job success ratios, wasted compute hours, and failure timelines
-- `cost_alerts` view for SQL Alert integration
+- `cost_alerts` temp view (via `.createOrReplaceTempView()`) for SQL Alert integration
 
 ### 02 — Data Quality and Lakehouse Monitoring
 
@@ -49,7 +51,7 @@ Measures statistical distribution, tracks data drift, and monitors DLT expectati
 
 Traces upstream origins and downstream dependencies of datasets for impact analysis before schema changes or data fixes.
 
-**Data sources:** `system.access.table_lineage`, `system.access.column_lineage`, Data Lineage REST API (fallback)
+**Data sources:** `TABLE_LINEAGE`, `COLUMN_LINEAGE` (from `table_config.py`), Data Lineage REST API (fallback)
 
 **Key outputs:**
 - Direct upstream and downstream table mappings
@@ -84,12 +86,25 @@ Standardizes Python-based error handling and log aggregation for workloads outsi
 
 ## Alerting Integration
 
-Each notebook (01–05) produces temporary views designed for use with [Databricks SQL Alerts](https://docs.databricks.com/sql/user/alerts/index.html). These can trigger notifications via email, Slack, Teams, or PagerDuty webhooks when:
+Each notebook (01–05) produces temporary views (via `.createOrReplaceTempView()`) designed for use with [Databricks SQL Alerts](https://docs.databricks.com/sql/user/alerts/index.html). These can trigger notifications via email, Slack, Teams, or PagerDuty webhooks when:
 - Spend growth exceeds configured thresholds
 - Job failure rates spike
 - Data quality expectations are breached
 - Streaming backlogs grow beyond safe limits
 - Application error rates increase
+
+## Table Configuration
+
+System table references are managed in `notebooks/table_config.py`. Edit this file to point at different catalogs or schemas:
+
+| Constant | Default Value |
+|----------|---------------|
+| `BILLING_USAGE` | `system.billing.usage` |
+| `BILLING_LIST_PRICES` | `system.billing.list_prices` |
+| `LAKEFLOW_JOBS` | `system.lakeflow.jobs` |
+| `LAKEFLOW_JOB_RUN_TIMELINE` | `system.lakeflow.job_run_timeline` |
+| `TABLE_LINEAGE` | `system.access.table_lineage` |
+| `COLUMN_LINEAGE` | `system.access.column_lineage` |
 
 ## Deployment
 
