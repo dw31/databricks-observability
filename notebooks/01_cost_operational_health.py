@@ -23,6 +23,12 @@
 
 # COMMAND ----------
 
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+from table_config import BILLING_USAGE, BILLING_LIST_PRICES, LAKEFLOW_JOBS, LAKEFLOW_JOB_RUN_TIMELINE
+
+# COMMAND ----------
+
 # Lookback windows (days)
 SPEND_LOOKBACK_DAYS = 30
 TREND_SHORT_WINDOW = 7
@@ -41,77 +47,81 @@ FAILURE_COST_ALERT_THRESHOLD = 100.0  # Alert if wasted failure cost exceeds thi
 
 # COMMAND ----------
 
-# MAGIC %sql
-# MAGIC CREATE OR REPLACE TEMP VIEW daily_spend AS
-# MAGIC SELECT
-# MAGIC   u.usage_date,
-# MAGIC   u.sku_name,
-# MAGIC   u.usage_unit,
-# MAGIC   SUM(u.usage_quantity) AS total_usage,
-# MAGIC   SUM(u.usage_quantity * lp.pricing.default) AS total_cost
-# MAGIC FROM system.billing.usage u
-# MAGIC LEFT JOIN system.billing.list_prices lp
-# MAGIC   ON u.sku_name = lp.sku_name
-# MAGIC   AND u.usage_unit = lp.usage_unit
-# MAGIC   AND u.usage_date BETWEEN lp.price_start_time AND COALESCE(lp.price_end_time, CURRENT_DATE())
-# MAGIC WHERE u.usage_date >= CURRENT_DATE() - INTERVAL 60 DAYS
-# MAGIC GROUP BY u.usage_date, u.sku_name, u.usage_unit
+# Build daily_spend DataFrame
+usage_df = spark.table(BILLING_USAGE).alias("u")
+list_prices_df = spark.table(BILLING_LIST_PRICES).alias("lp")
+
+daily_spend_df = (
+    usage_df
+    .join(
+        list_prices_df,
+        (F.col("u.sku_name") == F.col("lp.sku_name"))
+        & (F.col("u.usage_unit") == F.col("lp.usage_unit"))
+        & (F.col("u.usage_date").between(F.col("lp.price_start_time"), F.coalesce(F.col("lp.price_end_time"), F.current_date()))),
+        "left",
+    )
+    .where(F.col("u.usage_date") >= F.date_sub(F.current_date(), 60))
+    .groupBy(F.col("u.usage_date").alias("usage_date"), F.col("u.sku_name").alias("sku_name"), F.col("u.usage_unit").alias("usage_unit"))
+    .agg(
+        F.sum("u.usage_quantity").alias("total_usage"),
+        F.sum(F.col("u.usage_quantity") * F.col("lp.pricing.default")).alias("total_cost"),
+    )
+)
+
+daily_spend_df.createOrReplaceTempView("daily_spend")
+display(daily_spend_df)
 
 # COMMAND ----------
 
-# MAGIC %sql
-# MAGIC -- 7-day and 14-day rolling spend with growth rates
-# MAGIC WITH daily_total AS (
-# MAGIC   SELECT
-# MAGIC     usage_date,
-# MAGIC     SUM(total_cost) AS day_cost
-# MAGIC   FROM daily_spend
-# MAGIC   GROUP BY usage_date
-# MAGIC ),
-# MAGIC rolling AS (
-# MAGIC   SELECT
-# MAGIC     usage_date,
-# MAGIC     day_cost,
-# MAGIC     SUM(day_cost) OVER (
-# MAGIC       ORDER BY usage_date
-# MAGIC       ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
-# MAGIC     ) AS rolling_7d_cost,
-# MAGIC     SUM(day_cost) OVER (
-# MAGIC       ORDER BY usage_date
-# MAGIC       ROWS BETWEEN 13 PRECEDING AND CURRENT ROW
-# MAGIC     ) AS rolling_14d_cost
-# MAGIC   FROM daily_total
-# MAGIC ),
-# MAGIC with_prior AS (
-# MAGIC   SELECT
-# MAGIC     usage_date,
-# MAGIC     day_cost,
-# MAGIC     rolling_7d_cost,
-# MAGIC     rolling_14d_cost,
-# MAGIC     LAG(rolling_7d_cost, 7) OVER (ORDER BY usage_date) AS prior_7d_cost,
-# MAGIC     LAG(rolling_14d_cost, 14) OVER (ORDER BY usage_date) AS prior_14d_cost
-# MAGIC   FROM rolling
-# MAGIC )
-# MAGIC SELECT
-# MAGIC   usage_date,
-# MAGIC   day_cost,
-# MAGIC   rolling_7d_cost,
-# MAGIC   rolling_14d_cost,
-# MAGIC   ROUND(
-# MAGIC     CASE WHEN prior_7d_cost > 0
-# MAGIC       THEN ((rolling_7d_cost - prior_7d_cost) / prior_7d_cost) * 100
-# MAGIC       ELSE NULL
-# MAGIC     END, 2
-# MAGIC   ) AS spend_growth_7d_pct,
-# MAGIC   ROUND(
-# MAGIC     CASE WHEN prior_14d_cost > 0
-# MAGIC       THEN ((rolling_14d_cost - prior_14d_cost) / prior_14d_cost) * 100
-# MAGIC       ELSE NULL
-# MAGIC     END, 2
-# MAGIC   ) AS spend_growth_14d_pct
-# MAGIC FROM with_prior
-# MAGIC WHERE usage_date >= CURRENT_DATE() - INTERVAL 30 DAYS
-# MAGIC ORDER BY usage_date DESC
+# 7-day and 14-day rolling spend with growth rates
+daily_total_df = (
+    daily_spend_df
+    .groupBy("usage_date")
+    .agg(F.sum("total_cost").alias("day_cost"))
+)
+
+date_window = Window.orderBy("usage_date")
+rolling_7d_window = Window.orderBy("usage_date").rowsBetween(-6, 0)
+rolling_14d_window = Window.orderBy("usage_date").rowsBetween(-13, 0)
+
+rolling_df = (
+    daily_total_df
+    .withColumn("rolling_7d_cost", F.sum("day_cost").over(rolling_7d_window))
+    .withColumn("rolling_14d_cost", F.sum("day_cost").over(rolling_14d_window))
+)
+
+with_prior_df = (
+    rolling_df
+    .withColumn("prior_7d_cost", F.lag("rolling_7d_cost", 7).over(date_window))
+    .withColumn("prior_14d_cost", F.lag("rolling_14d_cost", 14).over(date_window))
+)
+
+spend_trend_df = (
+    with_prior_df
+    .withColumn(
+        "spend_growth_7d_pct",
+        F.round(
+            F.when(F.col("prior_7d_cost") > 0,
+                   ((F.col("rolling_7d_cost") - F.col("prior_7d_cost")) / F.col("prior_7d_cost")) * 100)
+            .otherwise(F.lit(None)),
+            2,
+        ),
+    )
+    .withColumn(
+        "spend_growth_14d_pct",
+        F.round(
+            F.when(F.col("prior_14d_cost") > 0,
+                   ((F.col("rolling_14d_cost") - F.col("prior_14d_cost")) / F.col("prior_14d_cost")) * 100)
+            .otherwise(F.lit(None)),
+            2,
+        ),
+    )
+    .where(F.col("usage_date") >= F.date_sub(F.current_date(), SPEND_LOOKBACK_DAYS))
+    .select("usage_date", "day_cost", "rolling_7d_cost", "rolling_14d_cost", "spend_growth_7d_pct", "spend_growth_14d_pct")
+    .orderBy(F.col("usage_date").desc())
+)
+
+display(spend_trend_df)
 
 # COMMAND ----------
 
@@ -122,25 +132,32 @@ FAILURE_COST_ALERT_THRESHOLD = 100.0  # Alert if wasted failure cost exceeds thi
 
 # COMMAND ----------
 
-# MAGIC %sql
-# MAGIC SELECT
-# MAGIC   j.job_id,
-# MAGIC   j.name AS job_name,
-# MAGIC   j.creator,
-# MAGIC   COUNT(DISTINCT rt.run_id) AS total_runs,
-# MAGIC   ROUND(SUM(rt.result_execution_duration / 3600.0 * lp.pricing.default), 2) AS estimated_total_cost,
-# MAGIC   ROUND(AVG(rt.result_execution_duration / 3600.0 * lp.pricing.default), 2) AS avg_cost_per_run,
-# MAGIC   ROUND(SUM(rt.result_execution_duration) / 3600.0, 2) AS total_dbu_hours
-# MAGIC FROM system.lakeflow.job_run_timeline rt
-# MAGIC INNER JOIN system.lakeflow.jobs j
-# MAGIC   ON rt.job_id = j.job_id
-# MAGIC LEFT JOIN system.billing.list_prices lp
-# MAGIC   ON lp.sku_name = 'JOBS_COMPUTE'
-# MAGIC   AND rt.period_start_time BETWEEN lp.price_start_time AND COALESCE(lp.price_end_time, CURRENT_TIMESTAMP())
-# MAGIC WHERE rt.period_start_time >= CURRENT_DATE() - INTERVAL 30 DAYS
-# MAGIC GROUP BY j.job_id, j.name, j.creator
-# MAGIC ORDER BY estimated_total_cost DESC
-# MAGIC LIMIT 25
+run_timeline_df = spark.table(LAKEFLOW_JOB_RUN_TIMELINE).alias("rt")
+jobs_df = spark.table(LAKEFLOW_JOBS).alias("j")
+lp_df = spark.table(BILLING_LIST_PRICES).alias("lp")
+
+expensive_jobs_df = (
+    run_timeline_df
+    .join(jobs_df, F.col("rt.job_id") == F.col("j.job_id"), "inner")
+    .join(
+        lp_df,
+        (F.col("lp.sku_name") == F.lit("JOBS_COMPUTE"))
+        & (F.col("rt.period_start_time").between(F.col("lp.price_start_time"), F.coalesce(F.col("lp.price_end_time"), F.current_timestamp()))),
+        "left",
+    )
+    .where(F.col("rt.period_start_time") >= F.date_sub(F.current_date(), SPEND_LOOKBACK_DAYS))
+    .groupBy(F.col("j.job_id").alias("job_id"), F.col("j.name").alias("job_name"), F.col("j.creator").alias("creator"))
+    .agg(
+        F.countDistinct("rt.run_id").alias("total_runs"),
+        F.round(F.sum(F.col("rt.result_execution_duration") / 3600.0 * F.col("lp.pricing.default")), 2).alias("estimated_total_cost"),
+        F.round(F.avg(F.col("rt.result_execution_duration") / 3600.0 * F.col("lp.pricing.default")), 2).alias("avg_cost_per_run"),
+        F.round(F.sum(F.col("rt.result_execution_duration")) / 3600.0, 2).alias("total_dbu_hours"),
+    )
+    .orderBy(F.col("estimated_total_cost").desc())
+    .limit(25)
+)
+
+display(expensive_jobs_df)
 
 # COMMAND ----------
 
@@ -151,61 +168,76 @@ FAILURE_COST_ALERT_THRESHOLD = 100.0  # Alert if wasted failure cost exceeds thi
 
 # COMMAND ----------
 
-# MAGIC %sql
-# MAGIC -- Job success/failure breakdown with cost impact
-# MAGIC WITH run_results AS (
-# MAGIC   SELECT
-# MAGIC     j.job_id,
-# MAGIC     j.name AS job_name,
-# MAGIC     rt.run_id,
-# MAGIC     rt.result_state,
-# MAGIC     rt.result_execution_duration,
-# MAGIC     CASE
-# MAGIC       WHEN rt.result_state IN ('ERROR', 'FAILED', 'TIMED_OUT') THEN 'FAILURE'
-# MAGIC       WHEN rt.result_state = 'SUCCESS' THEN 'SUCCESS'
-# MAGIC       ELSE 'OTHER'
-# MAGIC     END AS outcome
-# MAGIC   FROM system.lakeflow.job_run_timeline rt
-# MAGIC   INNER JOIN system.lakeflow.jobs j
-# MAGIC     ON rt.job_id = j.job_id
-# MAGIC   WHERE rt.period_start_time >= CURRENT_DATE() - INTERVAL 30 DAYS
-# MAGIC )
-# MAGIC SELECT
-# MAGIC   job_id,
-# MAGIC   job_name,
-# MAGIC   COUNT(*) AS total_runs,
-# MAGIC   SUM(CASE WHEN outcome = 'SUCCESS' THEN 1 ELSE 0 END) AS success_count,
-# MAGIC   SUM(CASE WHEN outcome = 'FAILURE' THEN 1 ELSE 0 END) AS failure_count,
-# MAGIC   ROUND(
-# MAGIC     SUM(CASE WHEN outcome = 'SUCCESS' THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2
-# MAGIC   ) AS success_rate_pct,
-# MAGIC   ROUND(
-# MAGIC     SUM(CASE WHEN outcome = 'FAILURE' THEN result_execution_duration ELSE 0 END) / 3600.0, 2
-# MAGIC   ) AS wasted_compute_hours,
-# MAGIC   SUM(CASE WHEN outcome = 'FAILURE' THEN 1 ELSE 0 END) AS repair_attempts
-# MAGIC FROM run_results
-# MAGIC GROUP BY job_id, job_name
-# MAGIC HAVING failure_count > 0
-# MAGIC ORDER BY failure_count DESC, wasted_compute_hours DESC
-# MAGIC LIMIT 25
+# Job success/failure breakdown with cost impact
+run_timeline_df2 = spark.table(LAKEFLOW_JOB_RUN_TIMELINE).alias("rt")
+jobs_df2 = spark.table(LAKEFLOW_JOBS).alias("j")
+
+run_results_df = (
+    run_timeline_df2
+    .join(jobs_df2, F.col("rt.job_id") == F.col("j.job_id"), "inner")
+    .where(F.col("rt.period_start_time") >= F.date_sub(F.current_date(), SPEND_LOOKBACK_DAYS))
+    .withColumn(
+        "outcome",
+        F.when(F.col("rt.result_state").isin("ERROR", "FAILED", "TIMED_OUT"), F.lit("FAILURE"))
+        .when(F.col("rt.result_state") == "SUCCESS", F.lit("SUCCESS"))
+        .otherwise(F.lit("OTHER")),
+    )
+    .select(
+        F.col("j.job_id").alias("job_id"),
+        F.col("j.name").alias("job_name"),
+        F.col("rt.run_id"),
+        F.col("rt.result_state"),
+        F.col("rt.result_execution_duration"),
+        "outcome",
+    )
+)
+
+failure_breakdown_df = (
+    run_results_df
+    .groupBy("job_id", "job_name")
+    .agg(
+        F.count("*").alias("total_runs"),
+        F.sum(F.when(F.col("outcome") == "SUCCESS", 1).otherwise(0)).alias("success_count"),
+        F.sum(F.when(F.col("outcome") == "FAILURE", 1).otherwise(0)).alias("failure_count"),
+        F.round(
+            F.sum(F.when(F.col("outcome") == "SUCCESS", 1).otherwise(0)) * 100.0 / F.count("*"), 2
+        ).alias("success_rate_pct"),
+        F.round(
+            F.sum(F.when(F.col("outcome") == "FAILURE", F.col("result_execution_duration")).otherwise(0)) / 3600.0, 2
+        ).alias("wasted_compute_hours"),
+        F.sum(F.when(F.col("outcome") == "FAILURE", 1).otherwise(0)).alias("repair_attempts"),
+    )
+    .where(F.col("failure_count") > 0)
+    .orderBy(F.col("failure_count").desc(), F.col("wasted_compute_hours").desc())
+    .limit(25)
+)
+
+display(failure_breakdown_df)
 
 # COMMAND ----------
 
-# MAGIC %sql
-# MAGIC -- Failure timeline: identify patterns in when failures occur
-# MAGIC SELECT
-# MAGIC   DATE(rt.period_start_time) AS failure_date,
-# MAGIC   HOUR(rt.period_start_time) AS failure_hour,
-# MAGIC   rt.result_state,
-# MAGIC   COUNT(*) AS failure_count,
-# MAGIC   COLLECT_SET(j.name) AS affected_jobs
-# MAGIC FROM system.lakeflow.job_run_timeline rt
-# MAGIC INNER JOIN system.lakeflow.jobs j
-# MAGIC   ON rt.job_id = j.job_id
-# MAGIC WHERE rt.result_state IN ('ERROR', 'FAILED', 'TIMED_OUT')
-# MAGIC   AND rt.period_start_time >= CURRENT_DATE() - INTERVAL 30 DAYS
-# MAGIC GROUP BY failure_date, failure_hour, rt.result_state
-# MAGIC ORDER BY failure_date DESC, failure_hour DESC
+# Failure timeline: identify patterns in when failures occur
+run_timeline_df3 = spark.table(LAKEFLOW_JOB_RUN_TIMELINE).alias("rt")
+jobs_df3 = spark.table(LAKEFLOW_JOBS).alias("j")
+
+failure_timeline_df = (
+    run_timeline_df3
+    .join(jobs_df3, F.col("rt.job_id") == F.col("j.job_id"), "inner")
+    .where(
+        F.col("rt.result_state").isin("ERROR", "FAILED", "TIMED_OUT")
+        & (F.col("rt.period_start_time") >= F.date_sub(F.current_date(), SPEND_LOOKBACK_DAYS))
+    )
+    .withColumn("failure_date", F.to_date("rt.period_start_time"))
+    .withColumn("failure_hour", F.hour("rt.period_start_time"))
+    .groupBy("failure_date", "failure_hour", F.col("rt.result_state").alias("result_state"))
+    .agg(
+        F.count("*").alias("failure_count"),
+        F.collect_set("j.name").alias("affected_jobs"),
+    )
+    .orderBy(F.col("failure_date").desc(), F.col("failure_hour").desc())
+)
+
+display(failure_timeline_df)
 
 # COMMAND ----------
 
@@ -216,34 +248,56 @@ FAILURE_COST_ALERT_THRESHOLD = 100.0  # Alert if wasted failure cost exceeds thi
 
 # COMMAND ----------
 
-# MAGIC %sql
-# MAGIC -- Alert-ready view: cost spikes and high failure rates
-# MAGIC CREATE OR REPLACE TEMP VIEW cost_alerts AS
-# MAGIC WITH recent_spend AS (
-# MAGIC   SELECT
-# MAGIC     SUM(CASE WHEN usage_date >= CURRENT_DATE() - INTERVAL 7 DAYS THEN total_cost ELSE 0 END) AS last_7d_cost,
-# MAGIC     SUM(CASE WHEN usage_date BETWEEN CURRENT_DATE() - INTERVAL 14 DAYS AND CURRENT_DATE() - INTERVAL 8 DAYS THEN total_cost ELSE 0 END) AS prev_7d_cost
-# MAGIC   FROM daily_spend
-# MAGIC ),
-# MAGIC failure_summary AS (
-# MAGIC   SELECT
-# MAGIC     COUNT(*) AS total_failures,
-# MAGIC     SUM(result_execution_duration) / 3600.0 AS total_wasted_hours
-# MAGIC   FROM system.lakeflow.job_run_timeline
-# MAGIC   WHERE result_state IN ('ERROR', 'FAILED', 'TIMED_OUT')
-# MAGIC     AND period_start_time >= CURRENT_DATE() - INTERVAL 7 DAYS
-# MAGIC )
-# MAGIC SELECT
-# MAGIC   rs.last_7d_cost,
-# MAGIC   rs.prev_7d_cost,
-# MAGIC   ROUND(((rs.last_7d_cost - rs.prev_7d_cost) / NULLIF(rs.prev_7d_cost, 0)) * 100, 2) AS spend_growth_pct,
-# MAGIC   fs.total_failures,
-# MAGIC   ROUND(fs.total_wasted_hours, 2) AS wasted_compute_hours,
-# MAGIC   CASE
-# MAGIC     WHEN ((rs.last_7d_cost - rs.prev_7d_cost) / NULLIF(rs.prev_7d_cost, 0)) * 100 > ${SPEND_GROWTH_ALERT_PCT} THEN 'ALERT'
-# MAGIC     ELSE 'OK'
-# MAGIC   END AS cost_alert_status
-# MAGIC FROM recent_spend rs
-# MAGIC CROSS JOIN failure_summary fs;
-# MAGIC
-# MAGIC SELECT * FROM cost_alerts
+# Alert-ready view: cost spikes and high failure rates
+
+# Recent spend: last 7 days vs previous 7 days
+daily_spend_cached = spark.table("daily_spend")
+
+recent_spend_df = daily_spend_cached.select(
+    F.sum(
+        F.when(F.col("usage_date") >= F.date_sub(F.current_date(), 7), F.col("total_cost")).otherwise(0)
+    ).alias("last_7d_cost"),
+    F.sum(
+        F.when(
+            (F.col("usage_date") >= F.date_sub(F.current_date(), 14))
+            & (F.col("usage_date") <= F.date_sub(F.current_date(), 8)),
+            F.col("total_cost"),
+        ).otherwise(0)
+    ).alias("prev_7d_cost"),
+)
+
+# Failure summary: last 7 days
+run_timeline_df4 = spark.table(LAKEFLOW_JOB_RUN_TIMELINE)
+
+failure_summary_df = (
+    run_timeline_df4
+    .where(
+        F.col("result_state").isin("ERROR", "FAILED", "TIMED_OUT")
+        & (F.col("period_start_time") >= F.date_sub(F.current_date(), 7))
+    )
+    .select(
+        F.count("*").alias("total_failures"),
+        (F.sum("result_execution_duration") / 3600.0).alias("total_wasted_hours"),
+    )
+)
+
+# Cross join and compute alert status
+cost_alerts_df = (
+    recent_spend_df.crossJoin(failure_summary_df)
+    .select(
+        F.col("last_7d_cost"),
+        F.col("prev_7d_cost"),
+        F.round(
+            ((F.col("last_7d_cost") - F.col("prev_7d_cost")) / F.nullif(F.col("prev_7d_cost"), F.lit(0))) * 100, 2
+        ).alias("spend_growth_pct"),
+        F.col("total_failures"),
+        F.round(F.col("total_wasted_hours"), 2).alias("wasted_compute_hours"),
+        F.when(
+            ((F.col("last_7d_cost") - F.col("prev_7d_cost")) / F.nullif(F.col("prev_7d_cost"), F.lit(0))) * 100 > SPEND_GROWTH_ALERT_PCT,
+            F.lit("ALERT"),
+        ).otherwise(F.lit("OK")).alias("cost_alert_status"),
+    )
+)
+
+cost_alerts_df.createOrReplaceTempView("cost_alerts")
+display(cost_alerts_df)

@@ -355,28 +355,37 @@ if os.path.exists(log_file):
 # COMMAND ----------
 
 if os.path.exists(log_file):
-    logs_df.createOrReplaceTempView("application_logs")
+    from pyspark.sql import functions as F
 
-    spark.sql("""
-        CREATE OR REPLACE TEMP VIEW log_alerts AS
-        SELECT
-            level,
-            COUNT(*) AS count,
-            MAX(timestamp) AS latest_occurrence,
-            COLLECT_SET(message) AS unique_messages,
-            CASE
-                WHEN level = 'CRITICAL' THEN 'PAGE'
-                WHEN level = 'ERROR' AND COUNT(*) > 5 THEN 'ALERT'
-                WHEN level = 'ERROR' THEN 'WARN'
-                ELSE 'OK'
-            END AS alert_action
-        FROM application_logs
-        WHERE level IN ('ERROR', 'CRITICAL')
-          AND timestamp >= DATE_FORMAT(CURRENT_TIMESTAMP() - INTERVAL 1 HOUR, "yyyy-MM-dd'T'HH:mm:ss")
-        GROUP BY level
-    """)
+    one_hour_ago = F.date_format(
+        F.current_timestamp() - F.expr("INTERVAL 1 HOUR"),
+        "yyyy-MM-dd'T'HH:mm:ss",
+    )
 
-    display(spark.sql("SELECT * FROM log_alerts"))
+    log_alerts_df = (
+        logs_df
+        .where(
+            (F.col("level").isin("ERROR", "CRITICAL"))
+            & (F.col("timestamp") >= one_hour_ago)
+        )
+        .groupBy("level")
+        .agg(
+            F.count("*").alias("count"),
+            F.max("timestamp").alias("latest_occurrence"),
+            F.collect_set("message").alias("unique_messages"),
+        )
+        .withColumn(
+            "alert_action",
+            F.when(F.col("level") == "CRITICAL", "PAGE")
+            .when((F.col("level") == "ERROR") & (F.col("count") > 5), "ALERT")
+            .when(F.col("level") == "ERROR", "WARN")
+            .otherwise("OK"),
+        )
+    )
+
+    log_alerts_df.createOrReplaceTempView("log_alerts")
+
+    display(log_alerts_df)
 
 # COMMAND ----------
 

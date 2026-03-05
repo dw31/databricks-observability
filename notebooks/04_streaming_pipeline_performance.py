@@ -40,70 +40,80 @@ LOOKBACK_DAYS = 7
 # COMMAND ----------
 
 from pyspark.sql import functions as F
+from pyspark.sql.window import Window
 
 if PIPELINE_ID:
-    flow_progress_df = spark.sql(f"""
-        SELECT
-            timestamp,
-            origin.flow_name,
-            origin.dataset_name,
-            details:flow_progress:num_output_rows AS num_output_rows,
-            details:flow_progress:metrics:num_output_rows AS metric_output_rows,
-            details:flow_progress:status AS flow_status,
-            details:flow_progress:data_quality AS data_quality
-        FROM event_log('{PIPELINE_ID}')
-        WHERE event_type = 'flow_progress'
-          AND timestamp >= CURRENT_TIMESTAMP() - INTERVAL {LOOKBACK_DAYS} DAYS
-        ORDER BY timestamp DESC
-    """)
+    # Load raw event_log via TVF, then filter/transform with PySpark
+    raw_events_df = spark.sql(f"SELECT * FROM event_log('{PIPELINE_ID}')")
+
+    flow_progress_df = (
+        raw_events_df
+        .filter(F.col("event_type") == "flow_progress")
+        .filter(F.col("timestamp") >= F.current_timestamp() - F.expr(f"INTERVAL {LOOKBACK_DAYS} DAYS"))
+        .select(
+            F.col("timestamp"),
+            F.col("origin.flow_name").alias("flow_name"),
+            F.col("origin.dataset_name").alias("dataset_name"),
+            F.col("details:flow_progress:num_output_rows").alias("num_output_rows"),
+            F.col("details:flow_progress:metrics:num_output_rows").alias("metric_output_rows"),
+            F.col("details:flow_progress:status").alias("flow_status"),
+            F.col("details:flow_progress:data_quality").alias("data_quality"),
+        )
+        .orderBy(F.col("timestamp").desc())
+    )
 
     display(flow_progress_df)
 
 # COMMAND ----------
 
 if PIPELINE_ID:
-    throughput_df = spark.sql(f"""
-        WITH flow_metrics AS (
-            SELECT
-                origin.flow_name,
-                origin.dataset_name,
-                timestamp,
-                CAST(details:flow_progress:num_output_rows AS BIGINT) AS output_rows,
-                LAG(timestamp) OVER (
-                    PARTITION BY origin.flow_name
-                    ORDER BY timestamp
-                ) AS prev_timestamp
-            FROM event_log('{PIPELINE_ID}')
-            WHERE event_type = 'flow_progress'
-              AND timestamp >= CURRENT_TIMESTAMP() - INTERVAL {LOOKBACK_DAYS} DAYS
-        ),
-        with_duration AS (
-            SELECT
-                flow_name,
-                dataset_name,
-                timestamp,
-                output_rows,
-                TIMESTAMPDIFF(SECOND, prev_timestamp, timestamp) AS batch_duration_seconds
-            FROM flow_metrics
-            WHERE prev_timestamp IS NOT NULL
+    raw_events_df = spark.sql(f"SELECT * FROM event_log('{PIPELINE_ID}')")
+
+    # Build flow metrics with LAG window
+    flow_window = Window.partitionBy("flow_name").orderBy("timestamp")
+
+    flow_metrics_df = (
+        raw_events_df
+        .filter(F.col("event_type") == "flow_progress")
+        .filter(F.col("timestamp") >= F.current_timestamp() - F.expr(f"INTERVAL {LOOKBACK_DAYS} DAYS"))
+        .select(
+            F.col("origin.flow_name").alias("flow_name"),
+            F.col("origin.dataset_name").alias("dataset_name"),
+            F.col("timestamp"),
+            F.col("details:flow_progress:num_output_rows").cast("bigint").alias("output_rows"),
         )
-        SELECT
-            flow_name,
-            dataset_name,
-            COUNT(*) AS total_batches,
-            ROUND(AVG(batch_duration_seconds), 2) AS avg_batch_duration_sec,
-            ROUND(MIN(batch_duration_seconds), 2) AS min_batch_duration_sec,
-            ROUND(MAX(batch_duration_seconds), 2) AS max_batch_duration_sec,
-            ROUND(PERCENTILE(batch_duration_seconds, 0.95), 2) AS p95_batch_duration_sec,
-            SUM(output_rows) AS total_rows_processed,
-            ROUND(
-                SUM(output_rows) / NULLIF(SUM(batch_duration_seconds), 0), 2
-            ) AS avg_rows_per_second
-        FROM with_duration
-        WHERE batch_duration_seconds > 0
-        GROUP BY flow_name, dataset_name
-        ORDER BY avg_rows_per_second DESC
-    """)
+        .withColumn("prev_timestamp", F.lag("timestamp").over(flow_window))
+    )
+
+    # Calculate batch durations
+    with_duration_df = (
+        flow_metrics_df
+        .filter(F.col("prev_timestamp").isNotNull())
+        .withColumn(
+            "batch_duration_seconds",
+            F.unix_timestamp("timestamp") - F.unix_timestamp("prev_timestamp"),
+        )
+        .filter(F.col("batch_duration_seconds") > 0)
+    )
+
+    # Aggregate throughput stats
+    throughput_df = (
+        with_duration_df
+        .groupBy("flow_name", "dataset_name")
+        .agg(
+            F.count("*").alias("total_batches"),
+            F.round(F.avg("batch_duration_seconds"), 2).alias("avg_batch_duration_sec"),
+            F.round(F.min("batch_duration_seconds"), 2).alias("min_batch_duration_sec"),
+            F.round(F.max("batch_duration_seconds"), 2).alias("max_batch_duration_sec"),
+            F.round(F.percentile_approx("batch_duration_seconds", 0.95), 2).alias("p95_batch_duration_sec"),
+            F.sum("output_rows").alias("total_rows_processed"),
+            F.round(
+                F.sum("output_rows") / F.when(F.sum("batch_duration_seconds") != 0, F.sum("batch_duration_seconds")),
+                2,
+            ).alias("avg_rows_per_second"),
+        )
+        .orderBy(F.col("avg_rows_per_second").desc())
+    )
 
     display(throughput_df)
 
@@ -118,64 +128,72 @@ if PIPELINE_ID:
 # COMMAND ----------
 
 if PIPELINE_ID:
-    backlog_df = spark.sql(f"""
-        SELECT
-            timestamp,
-            origin.flow_name,
-            origin.dataset_name,
-            CAST(details:flow_progress:metrics:backlog_bytes AS BIGINT) AS backlog_bytes,
-            CAST(details:flow_progress:metrics:backlog_files AS BIGINT) AS backlog_files,
-            CAST(details:flow_progress:metrics:num_output_rows AS BIGINT) AS output_rows
-        FROM event_log('{PIPELINE_ID}')
-        WHERE event_type = 'flow_progress'
-          AND (
-              details:flow_progress:metrics:backlog_bytes IS NOT NULL
-              OR details:flow_progress:metrics:backlog_files IS NOT NULL
-          )
-          AND timestamp >= CURRENT_TIMESTAMP() - INTERVAL {LOOKBACK_DAYS} DAYS
-        ORDER BY timestamp DESC
-    """)
+    raw_events_df = spark.sql(f"SELECT * FROM event_log('{PIPELINE_ID}')")
+
+    backlog_df = (
+        raw_events_df
+        .filter(F.col("event_type") == "flow_progress")
+        .filter(
+            F.col("details:flow_progress:metrics:backlog_bytes").isNotNull()
+            | F.col("details:flow_progress:metrics:backlog_files").isNotNull()
+        )
+        .filter(F.col("timestamp") >= F.current_timestamp() - F.expr(f"INTERVAL {LOOKBACK_DAYS} DAYS"))
+        .select(
+            F.col("timestamp"),
+            F.col("origin.flow_name").alias("flow_name"),
+            F.col("origin.dataset_name").alias("dataset_name"),
+            F.col("details:flow_progress:metrics:backlog_bytes").cast("bigint").alias("backlog_bytes"),
+            F.col("details:flow_progress:metrics:backlog_files").cast("bigint").alias("backlog_files"),
+            F.col("details:flow_progress:metrics:num_output_rows").cast("bigint").alias("output_rows"),
+        )
+        .orderBy(F.col("timestamp").desc())
+    )
 
     display(backlog_df)
 
 # COMMAND ----------
 
 if PIPELINE_ID:
-    # Backlog trend analysis: detect growing backlogs
-    backlog_trend_df = spark.sql(f"""
-        WITH backlog_series AS (
-            SELECT
-                origin.flow_name,
-                DATE(timestamp) AS log_date,
-                AVG(CAST(details:flow_progress:metrics:backlog_bytes AS BIGINT)) AS avg_backlog_bytes,
-                MAX(CAST(details:flow_progress:metrics:backlog_bytes AS BIGINT)) AS max_backlog_bytes,
-                AVG(CAST(details:flow_progress:metrics:backlog_files AS BIGINT)) AS avg_backlog_files,
-                MAX(CAST(details:flow_progress:metrics:backlog_files AS BIGINT)) AS max_backlog_files
-            FROM event_log('{PIPELINE_ID}')
-            WHERE event_type = 'flow_progress'
-              AND details:flow_progress:metrics:backlog_bytes IS NOT NULL
-              AND timestamp >= CURRENT_TIMESTAMP() - INTERVAL {LOOKBACK_DAYS} DAYS
-            GROUP BY origin.flow_name, DATE(timestamp)
+    raw_events_df = spark.sql(f"SELECT * FROM event_log('{PIPELINE_ID}')")
+
+    # Daily backlog aggregation
+    backlog_daily_df = (
+        raw_events_df
+        .filter(F.col("event_type") == "flow_progress")
+        .filter(F.col("details:flow_progress:metrics:backlog_bytes").isNotNull())
+        .filter(F.col("timestamp") >= F.current_timestamp() - F.expr(f"INTERVAL {LOOKBACK_DAYS} DAYS"))
+        .withColumn("flow_name", F.col("origin.flow_name"))
+        .withColumn("log_date", F.to_date("timestamp"))
+        .withColumn("backlog_bytes_val", F.col("details:flow_progress:metrics:backlog_bytes").cast("bigint"))
+        .withColumn("backlog_files_val", F.col("details:flow_progress:metrics:backlog_files").cast("bigint"))
+        .groupBy("flow_name", "log_date")
+        .agg(
+            F.avg("backlog_bytes_val").alias("avg_backlog_bytes"),
+            F.max("backlog_bytes_val").alias("max_backlog_bytes"),
+            F.avg("backlog_files_val").alias("avg_backlog_files"),
+            F.max("backlog_files_val").alias("max_backlog_files"),
         )
-        SELECT
-            flow_name,
-            log_date,
-            avg_backlog_bytes,
-            max_backlog_bytes,
-            avg_backlog_files,
-            max_backlog_files,
-            LAG(avg_backlog_bytes) OVER (PARTITION BY flow_name ORDER BY log_date) AS prev_day_avg_bytes,
-            CASE
-                WHEN LAG(avg_backlog_bytes) OVER (PARTITION BY flow_name ORDER BY log_date) > 0
-                    THEN ROUND(
-                        (avg_backlog_bytes - LAG(avg_backlog_bytes) OVER (PARTITION BY flow_name ORDER BY log_date))
-                        / LAG(avg_backlog_bytes) OVER (PARTITION BY flow_name ORDER BY log_date) * 100, 2
-                    )
-                ELSE NULL
-            END AS backlog_growth_pct
-        FROM backlog_series
-        ORDER BY flow_name, log_date DESC
-    """)
+    )
+
+    # Backlog trend with LAG for day-over-day growth
+    trend_window = Window.partitionBy("flow_name").orderBy("log_date")
+
+    backlog_trend_df = (
+        backlog_daily_df
+        .withColumn("prev_day_avg_bytes", F.lag("avg_backlog_bytes").over(trend_window))
+        .withColumn(
+            "backlog_growth_pct",
+            F.when(
+                F.col("prev_day_avg_bytes") > 0,
+                F.round(
+                    (F.col("avg_backlog_bytes") - F.col("prev_day_avg_bytes"))
+                    / F.col("prev_day_avg_bytes") * 100,
+                    2,
+                ),
+            ),
+        )
+        .orderBy("flow_name", F.col("log_date").desc())
+    )
 
     display(backlog_trend_df)
 
@@ -189,47 +207,58 @@ if PIPELINE_ID:
 # COMMAND ----------
 
 if PIPELINE_ID:
-    resource_df = spark.sql(f"""
-        SELECT
-            timestamp,
-            origin.flow_name,
-            CAST(details:flow_progress:metrics:num_task_slots AS INT) AS num_task_slots,
-            CAST(details:flow_progress:metrics:num_queued_tasks AS INT) AS num_queued_tasks,
-            CAST(details:flow_progress:metrics:num_active_tasks AS INT) AS num_active_tasks
-        FROM event_log('{PIPELINE_ID}')
-        WHERE event_type = 'flow_progress'
-          AND (
-              details:flow_progress:metrics:num_task_slots IS NOT NULL
-              OR details:flow_progress:metrics:num_queued_tasks IS NOT NULL
-          )
-          AND timestamp >= CURRENT_TIMESTAMP() - INTERVAL {LOOKBACK_DAYS} DAYS
-        ORDER BY timestamp DESC
-    """)
+    raw_events_df = spark.sql(f"SELECT * FROM event_log('{PIPELINE_ID}')")
+
+    resource_df = (
+        raw_events_df
+        .filter(F.col("event_type") == "flow_progress")
+        .filter(
+            F.col("details:flow_progress:metrics:num_task_slots").isNotNull()
+            | F.col("details:flow_progress:metrics:num_queued_tasks").isNotNull()
+        )
+        .filter(F.col("timestamp") >= F.current_timestamp() - F.expr(f"INTERVAL {LOOKBACK_DAYS} DAYS"))
+        .select(
+            F.col("timestamp"),
+            F.col("origin.flow_name").alias("flow_name"),
+            F.col("details:flow_progress:metrics:num_task_slots").cast("int").alias("num_task_slots"),
+            F.col("details:flow_progress:metrics:num_queued_tasks").cast("int").alias("num_queued_tasks"),
+            F.col("details:flow_progress:metrics:num_active_tasks").cast("int").alias("num_active_tasks"),
+        )
+        .orderBy(F.col("timestamp").desc())
+    )
 
     display(resource_df)
 
 # COMMAND ----------
 
 if PIPELINE_ID:
+    raw_events_df = spark.sql(f"SELECT * FROM event_log('{PIPELINE_ID}')")
+
     # Resource utilization summary
-    resource_summary_df = spark.sql(f"""
-        SELECT
-            origin.flow_name,
-            ROUND(AVG(CAST(details:flow_progress:metrics:num_task_slots AS INT)), 2) AS avg_task_slots,
-            ROUND(AVG(CAST(details:flow_progress:metrics:num_queued_tasks AS INT)), 2) AS avg_queued_tasks,
-            ROUND(AVG(CAST(details:flow_progress:metrics:num_active_tasks AS INT)), 2) AS avg_active_tasks,
-            MAX(CAST(details:flow_progress:metrics:num_queued_tasks AS INT)) AS max_queued_tasks,
-            ROUND(
-                AVG(CAST(details:flow_progress:metrics:num_active_tasks AS INT))
-                / NULLIF(AVG(CAST(details:flow_progress:metrics:num_task_slots AS INT)), 0) * 100, 2
-            ) AS avg_utilization_pct
-        FROM event_log('{PIPELINE_ID}')
-        WHERE event_type = 'flow_progress'
-          AND details:flow_progress:metrics:num_task_slots IS NOT NULL
-          AND timestamp >= CURRENT_TIMESTAMP() - INTERVAL {LOOKBACK_DAYS} DAYS
-        GROUP BY origin.flow_name
-        ORDER BY avg_utilization_pct DESC
-    """)
+    resource_summary_df = (
+        raw_events_df
+        .filter(F.col("event_type") == "flow_progress")
+        .filter(F.col("details:flow_progress:metrics:num_task_slots").isNotNull())
+        .filter(F.col("timestamp") >= F.current_timestamp() - F.expr(f"INTERVAL {LOOKBACK_DAYS} DAYS"))
+        .withColumn("flow_name", F.col("origin.flow_name"))
+        .withColumn("task_slots", F.col("details:flow_progress:metrics:num_task_slots").cast("int"))
+        .withColumn("queued_tasks", F.col("details:flow_progress:metrics:num_queued_tasks").cast("int"))
+        .withColumn("active_tasks", F.col("details:flow_progress:metrics:num_active_tasks").cast("int"))
+        .groupBy("flow_name")
+        .agg(
+            F.round(F.avg("task_slots"), 2).alias("avg_task_slots"),
+            F.round(F.avg("queued_tasks"), 2).alias("avg_queued_tasks"),
+            F.round(F.avg("active_tasks"), 2).alias("avg_active_tasks"),
+            F.max("queued_tasks").alias("max_queued_tasks"),
+            F.round(
+                F.avg("active_tasks")
+                / F.when(F.avg("task_slots") != 0, F.avg("task_slots"))
+                * 100,
+                2,
+            ).alias("avg_utilization_pct"),
+        )
+        .orderBy(F.col("avg_utilization_pct").desc())
+    )
 
     display(resource_summary_df)
 
@@ -244,38 +273,39 @@ if PIPELINE_ID:
 # COMMAND ----------
 
 if STREAMING_METRICS_TABLE:
-    listener_df = spark.sql(f"""
-        SELECT
-            query_name,
-            batch_id,
-            timestamp,
-            num_input_rows,
-            input_rows_per_second,
-            processed_rows_per_second,
-            batch_duration_ms,
-            ROUND(batch_duration_ms / 1000.0, 2) AS batch_duration_sec
-        FROM {STREAMING_METRICS_TABLE}
-        WHERE timestamp >= CURRENT_TIMESTAMP() - INTERVAL {LOOKBACK_DAYS} DAYS
-        ORDER BY timestamp DESC
-    """)
+    listener_df = (
+        spark.table(STREAMING_METRICS_TABLE)
+        .filter(F.col("timestamp") >= F.current_timestamp() - F.expr(f"INTERVAL {LOOKBACK_DAYS} DAYS"))
+        .select(
+            "query_name",
+            "batch_id",
+            "timestamp",
+            "num_input_rows",
+            "input_rows_per_second",
+            "processed_rows_per_second",
+            "batch_duration_ms",
+            F.round(F.col("batch_duration_ms") / 1000.0, 2).alias("batch_duration_sec"),
+        )
+        .orderBy(F.col("timestamp").desc())
+    )
 
     display(listener_df)
 
     # Summary statistics per query
-    listener_summary_df = spark.sql(f"""
-        SELECT
-            query_name,
-            COUNT(*) AS total_batches,
-            ROUND(AVG(batch_duration_ms) / 1000.0, 2) AS avg_batch_duration_sec,
-            ROUND(AVG(input_rows_per_second), 2) AS avg_input_rows_per_sec,
-            ROUND(AVG(processed_rows_per_second), 2) AS avg_processed_rows_per_sec,
-            SUM(num_input_rows) AS total_input_rows,
-            ROUND(PERCENTILE(batch_duration_ms, 0.95) / 1000.0, 2) AS p95_batch_duration_sec
-        FROM {STREAMING_METRICS_TABLE}
-        WHERE timestamp >= CURRENT_TIMESTAMP() - INTERVAL {LOOKBACK_DAYS} DAYS
-        GROUP BY query_name
-        ORDER BY avg_batch_duration_sec DESC
-    """)
+    listener_summary_df = (
+        spark.table(STREAMING_METRICS_TABLE)
+        .filter(F.col("timestamp") >= F.current_timestamp() - F.expr(f"INTERVAL {LOOKBACK_DAYS} DAYS"))
+        .groupBy("query_name")
+        .agg(
+            F.count("*").alias("total_batches"),
+            F.round(F.avg("batch_duration_ms") / 1000.0, 2).alias("avg_batch_duration_sec"),
+            F.round(F.avg("input_rows_per_second"), 2).alias("avg_input_rows_per_sec"),
+            F.round(F.avg("processed_rows_per_second"), 2).alias("avg_processed_rows_per_sec"),
+            F.sum("num_input_rows").alias("total_input_rows"),
+            F.round(F.percentile_approx("batch_duration_ms", 0.95) / 1000.0, 2).alias("p95_batch_duration_sec"),
+        )
+        .orderBy(F.col("avg_batch_duration_sec").desc())
+    )
 
     display(listener_summary_df)
 else:
@@ -291,49 +321,59 @@ else:
 # COMMAND ----------
 
 if PIPELINE_ID:
-    spark.sql(f"""
-        CREATE OR REPLACE TEMP VIEW streaming_alerts AS
-        WITH recent_backlogs AS (
-            SELECT
-                origin.flow_name,
-                AVG(CAST(details:flow_progress:metrics:backlog_bytes AS BIGINT)) AS avg_backlog_bytes,
-                MAX(CAST(details:flow_progress:metrics:backlog_bytes AS BIGINT)) AS max_backlog_bytes
-            FROM event_log('{PIPELINE_ID}')
-            WHERE event_type = 'flow_progress'
-              AND details:flow_progress:metrics:backlog_bytes IS NOT NULL
-              AND timestamp >= CURRENT_TIMESTAMP() - INTERVAL 1 DAY
-            GROUP BY origin.flow_name
-        ),
-        recent_utilization AS (
-            SELECT
-                origin.flow_name,
-                AVG(CAST(details:flow_progress:metrics:num_queued_tasks AS INT)) AS avg_queued,
-                AVG(CAST(details:flow_progress:metrics:num_active_tasks AS INT))
-                    / NULLIF(AVG(CAST(details:flow_progress:metrics:num_task_slots AS INT)), 0) * 100 AS utilization_pct
-            FROM event_log('{PIPELINE_ID}')
-            WHERE event_type = 'flow_progress'
-              AND details:flow_progress:metrics:num_task_slots IS NOT NULL
-              AND timestamp >= CURRENT_TIMESTAMP() - INTERVAL 1 DAY
-            GROUP BY origin.flow_name
-        )
-        SELECT
-            COALESCE(b.flow_name, u.flow_name) AS flow_name,
-            b.avg_backlog_bytes,
-            b.max_backlog_bytes,
-            ROUND(u.utilization_pct, 2) AS utilization_pct,
-            ROUND(u.avg_queued, 2) AS avg_queued_tasks,
-            CASE
-                WHEN b.max_backlog_bytes > 1073741824 THEN 'CRITICAL'
-                WHEN b.max_backlog_bytes > 104857600 THEN 'WARNING'
-                ELSE 'OK'
-            END AS backlog_alert,
-            CASE
-                WHEN u.utilization_pct > 90 THEN 'WARNING'
-                ELSE 'OK'
-            END AS utilization_alert
-        FROM recent_backlogs b
-        FULL OUTER JOIN recent_utilization u
-          ON b.flow_name = u.flow_name
-    """)
+    raw_events_df = spark.sql(f"SELECT * FROM event_log('{PIPELINE_ID}')")
 
-    display(spark.sql("SELECT * FROM streaming_alerts"))
+    # Recent backlogs (last 1 day)
+    recent_backlogs_df = (
+        raw_events_df
+        .filter(F.col("event_type") == "flow_progress")
+        .filter(F.col("details:flow_progress:metrics:backlog_bytes").isNotNull())
+        .filter(F.col("timestamp") >= F.current_timestamp() - F.expr("INTERVAL 1 DAY"))
+        .withColumn("flow_name", F.col("origin.flow_name"))
+        .withColumn("backlog_bytes_val", F.col("details:flow_progress:metrics:backlog_bytes").cast("bigint"))
+        .groupBy("flow_name")
+        .agg(
+            F.avg("backlog_bytes_val").alias("avg_backlog_bytes"),
+            F.max("backlog_bytes_val").alias("max_backlog_bytes"),
+        )
+    )
+
+    # Recent utilization (last 1 day)
+    recent_utilization_df = (
+        raw_events_df
+        .filter(F.col("event_type") == "flow_progress")
+        .filter(F.col("details:flow_progress:metrics:num_task_slots").isNotNull())
+        .filter(F.col("timestamp") >= F.current_timestamp() - F.expr("INTERVAL 1 DAY"))
+        .withColumn("flow_name", F.col("origin.flow_name"))
+        .withColumn("task_slots", F.col("details:flow_progress:metrics:num_task_slots").cast("int"))
+        .withColumn("queued_tasks", F.col("details:flow_progress:metrics:num_queued_tasks").cast("int"))
+        .withColumn("active_tasks", F.col("details:flow_progress:metrics:num_active_tasks").cast("int"))
+        .groupBy("flow_name")
+        .agg(
+            F.avg("queued_tasks").alias("avg_queued"),
+            (F.avg("active_tasks") / F.when(F.avg("task_slots") != 0, F.avg("task_slots")) * 100).alias("utilization_pct"),
+        )
+    )
+
+    # Full outer join and build alert columns
+    streaming_alerts_df = (
+        recent_backlogs_df.alias("b")
+        .join(recent_utilization_df.alias("u"), on="flow_name", how="full_outer")
+        .select(
+            F.col("flow_name"),
+            F.col("b.avg_backlog_bytes"),
+            F.col("b.max_backlog_bytes"),
+            F.round(F.col("u.utilization_pct"), 2).alias("utilization_pct"),
+            F.round(F.col("u.avg_queued"), 2).alias("avg_queued_tasks"),
+            F.when(F.col("b.max_backlog_bytes") > 1073741824, F.lit("CRITICAL"))
+            .when(F.col("b.max_backlog_bytes") > 104857600, F.lit("WARNING"))
+            .otherwise(F.lit("OK"))
+            .alias("backlog_alert"),
+            F.when(F.col("u.utilization_pct") > 90, F.lit("WARNING"))
+            .otherwise(F.lit("OK"))
+            .alias("utilization_alert"),
+        )
+    )
+
+    streaming_alerts_df.createOrReplaceTempView("streaming_alerts")
+    display(spark.table("streaming_alerts"))

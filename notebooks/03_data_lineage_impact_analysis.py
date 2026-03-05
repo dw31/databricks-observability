@@ -34,6 +34,12 @@ LOOKBACK_DAYS = 30
 
 # COMMAND ----------
 
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+from table_config import TABLE_LINEAGE, COLUMN_LINEAGE
+
+# COMMAND ----------
+
 # MAGIC %md
 # MAGIC ## 1. Upstream Tracking (Parent Tables)
 # MAGIC
@@ -41,21 +47,27 @@ LOOKBACK_DAYS = 30
 
 # COMMAND ----------
 
-# MAGIC %sql
-# MAGIC -- All upstream (source) tables for a given target
-# MAGIC SELECT
-# MAGIC   source_table_full_name AS upstream_table,
-# MAGIC   source_type,
-# MAGIC   target_table_full_name AS downstream_table,
-# MAGIC   target_type,
-# MAGIC   created_by,
-# MAGIC   entity_type AS transformation_entity,
-# MAGIC   entity_run_id,
-# MAGIC   event_time
-# MAGIC FROM system.access.table_lineage
-# MAGIC WHERE target_table_full_name = '${target_table}'
-# MAGIC   AND event_time >= CURRENT_TIMESTAMP() - INTERVAL ${LOOKBACK_DAYS} DAYS
-# MAGIC ORDER BY event_time DESC
+# All upstream (source) tables for a given target
+table_lineage_df = spark.table(TABLE_LINEAGE)
+
+upstream_direct_df = (
+    table_lineage_df
+    .filter(F.col("target_table_full_name") == TARGET_TABLE)
+    .filter(F.col("event_time") >= F.expr(f"CURRENT_TIMESTAMP() - INTERVAL {LOOKBACK_DAYS} DAYS"))
+    .select(
+        F.col("source_table_full_name").alias("upstream_table"),
+        F.col("source_type"),
+        F.col("target_table_full_name").alias("downstream_table"),
+        F.col("target_type"),
+        F.col("created_by"),
+        F.col("entity_type").alias("transformation_entity"),
+        F.col("entity_run_id"),
+        F.col("event_time"),
+    )
+    .orderBy(F.col("event_time").desc())
+)
+
+display(upstream_direct_df)
 
 # COMMAND ----------
 
@@ -67,21 +79,25 @@ LOOKBACK_DAYS = 30
 
 # COMMAND ----------
 
-# MAGIC %sql
-# MAGIC -- All downstream (dependent) tables from a given source
-# MAGIC SELECT
-# MAGIC   target_table_full_name AS downstream_table,
-# MAGIC   target_type,
-# MAGIC   source_table_full_name AS upstream_table,
-# MAGIC   source_type,
-# MAGIC   created_by,
-# MAGIC   entity_type AS transformation_entity,
-# MAGIC   entity_run_id,
-# MAGIC   event_time
-# MAGIC FROM system.access.table_lineage
-# MAGIC WHERE source_table_full_name = '${target_table}'
-# MAGIC   AND event_time >= CURRENT_TIMESTAMP() - INTERVAL ${LOOKBACK_DAYS} DAYS
-# MAGIC ORDER BY event_time DESC
+# All downstream (dependent) tables from a given source
+downstream_direct_df = (
+    table_lineage_df
+    .filter(F.col("source_table_full_name") == TARGET_TABLE)
+    .filter(F.col("event_time") >= F.expr(f"CURRENT_TIMESTAMP() - INTERVAL {LOOKBACK_DAYS} DAYS"))
+    .select(
+        F.col("target_table_full_name").alias("downstream_table"),
+        F.col("target_type"),
+        F.col("source_table_full_name").alias("upstream_table"),
+        F.col("source_type"),
+        F.col("created_by"),
+        F.col("entity_type").alias("transformation_entity"),
+        F.col("entity_run_id"),
+        F.col("event_time"),
+    )
+    .orderBy(F.col("event_time").desc())
+)
+
+display(downstream_direct_df)
 
 # COMMAND ----------
 
@@ -92,89 +108,82 @@ LOOKBACK_DAYS = 30
 
 # COMMAND ----------
 
-# Build a multi-hop lineage graph using iterative queries
-from pyspark.sql import functions as F
-
+# Build a multi-hop lineage graph using iterative traversal
 if TARGET_TABLE:
-    # Upstream traversal (recursive-like via iterative joins)
-    upstream_df = spark.sql(f"""
-        WITH RECURSIVE upstream_lineage AS (
-            -- Base case: direct parents
-            SELECT
-                source_table_full_name AS table_name,
-                target_table_full_name AS child_table,
-                1 AS depth,
-                entity_type AS transformation,
-                created_by
-            FROM system.access.table_lineage
-            WHERE target_table_full_name = '{TARGET_TABLE}'
-              AND event_time >= CURRENT_TIMESTAMP() - INTERVAL {LOOKBACK_DAYS} DAYS
+    lineage_df = spark.table(TABLE_LINEAGE)
+    lineage_df = lineage_df.filter(
+        F.col("event_time") >= F.expr(f"CURRENT_TIMESTAMP() - INTERVAL {LOOKBACK_DAYS} DAYS")
+    )
 
-            UNION ALL
+    # --- Upstream traversal (parents of parents, up to depth 5) ---
+    current_targets = [TARGET_TABLE]
+    all_upstream = []
 
-            -- Recursive case: parents of parents
-            SELECT
-                tl.source_table_full_name,
-                tl.target_table_full_name,
-                ul.depth + 1,
-                tl.entity_type,
-                tl.created_by
-            FROM system.access.table_lineage tl
-            INNER JOIN upstream_lineage ul
-              ON tl.target_table_full_name = ul.table_name
-            WHERE ul.depth < 5
-              AND tl.event_time >= CURRENT_TIMESTAMP() - INTERVAL {LOOKBACK_DAYS} DAYS
+    for depth in range(1, 6):
+        hop = (
+            lineage_df
+            .filter(F.col("target_table_full_name").isin(current_targets))
+            .select(
+                F.col("source_table_full_name").alias("upstream_table"),
+                F.col("target_table_full_name").alias("feeds_into"),
+                F.col("entity_type").alias("transformation"),
+                F.col("created_by"),
+            )
+            .distinct()
+            .withColumn("depth", F.lit(depth))
         )
-        SELECT DISTINCT
-            table_name AS upstream_table,
-            child_table AS feeds_into,
-            depth,
-            transformation,
-            created_by
-        FROM upstream_lineage
-        ORDER BY depth, upstream_table
-    """)
 
-    display(upstream_df)
+        if hop.count() == 0:
+            break
 
-    # Downstream traversal
-    downstream_df = spark.sql(f"""
-        WITH RECURSIVE downstream_lineage AS (
-            SELECT
-                target_table_full_name AS table_name,
-                source_table_full_name AS parent_table,
-                1 AS depth,
-                entity_type AS transformation,
-                created_by
-            FROM system.access.table_lineage
-            WHERE source_table_full_name = '{TARGET_TABLE}'
-              AND event_time >= CURRENT_TIMESTAMP() - INTERVAL {LOOKBACK_DAYS} DAYS
+        all_upstream.append(hop)
+        current_targets = [
+            row.upstream_table
+            for row in hop.select("upstream_table").distinct().collect()
+        ]
 
-            UNION ALL
+    if all_upstream:
+        from functools import reduce
+        upstream_df = reduce(lambda a, b: a.unionByName(b), all_upstream)
+        upstream_df = upstream_df.orderBy("depth", "upstream_table")
+        display(upstream_df)
+    else:
+        print("No upstream lineage found for the target table.")
 
-            SELECT
-                tl.target_table_full_name,
-                tl.source_table_full_name,
-                dl.depth + 1,
-                tl.entity_type,
-                tl.created_by
-            FROM system.access.table_lineage tl
-            INNER JOIN downstream_lineage dl
-              ON tl.source_table_full_name = dl.table_name
-            WHERE dl.depth < 5
-              AND tl.event_time >= CURRENT_TIMESTAMP() - INTERVAL {LOOKBACK_DAYS} DAYS
+    # --- Downstream traversal (children of children, up to depth 5) ---
+    current_sources = [TARGET_TABLE]
+    all_downstream = []
+
+    for depth in range(1, 6):
+        hop = (
+            lineage_df
+            .filter(F.col("source_table_full_name").isin(current_sources))
+            .select(
+                F.col("target_table_full_name").alias("downstream_table"),
+                F.col("source_table_full_name").alias("fed_by"),
+                F.col("entity_type").alias("transformation"),
+                F.col("created_by"),
+            )
+            .distinct()
+            .withColumn("depth", F.lit(depth))
         )
-        SELECT DISTINCT
-            table_name AS downstream_table,
-            parent_table AS fed_by,
-            depth,
-            transformation,
-            created_by
-        FROM downstream_lineage
-        ORDER BY depth, downstream_table
-    """)
 
-    display(downstream_df)
+        if hop.count() == 0:
+            break
+
+        all_downstream.append(hop)
+        current_sources = [
+            row.downstream_table
+            for row in hop.select("downstream_table").distinct().collect()
+        ]
+
+    if all_downstream:
+        from functools import reduce
+        downstream_df = reduce(lambda a, b: a.unionByName(b), all_downstream)
+        downstream_df = downstream_df.orderBy("depth", "downstream_table")
+        display(downstream_df)
+    else:
+        print("No downstream lineage found for the target table.")
 else:
     print("WARNING: No target_table provided. Set the widget value to trace lineage.")
 
@@ -188,41 +197,59 @@ else:
 
 # COMMAND ----------
 
-# MAGIC %sql
-# MAGIC -- Column-level upstream lineage
-# MAGIC SELECT
-# MAGIC   source_table_full_name AS source_table,
-# MAGIC   source_column_name AS source_column,
-# MAGIC   target_table_full_name AS target_table,
-# MAGIC   target_column_name AS target_column,
-# MAGIC   event_time
-# MAGIC FROM system.access.column_lineage
-# MAGIC WHERE target_table_full_name = '${target_table}'
-# MAGIC   AND (
-# MAGIC     '${target_column}' = ''
-# MAGIC     OR target_column_name = '${target_column}'
-# MAGIC   )
-# MAGIC   AND event_time >= CURRENT_TIMESTAMP() - INTERVAL ${LOOKBACK_DAYS} DAYS
-# MAGIC ORDER BY target_column_name, event_time DESC
+# Column-level upstream lineage
+column_lineage_df = spark.table(COLUMN_LINEAGE)
+
+col_upstream_df = (
+    column_lineage_df
+    .filter(F.col("target_table_full_name") == TARGET_TABLE)
+    .filter(F.col("event_time") >= F.expr(f"CURRENT_TIMESTAMP() - INTERVAL {LOOKBACK_DAYS} DAYS"))
+)
+
+# Apply optional column filter
+if TARGET_COLUMN:
+    col_upstream_df = col_upstream_df.filter(F.col("target_column_name") == TARGET_COLUMN)
+
+col_upstream_df = (
+    col_upstream_df
+    .select(
+        F.col("source_table_full_name").alias("source_table"),
+        F.col("source_column_name").alias("source_column"),
+        F.col("target_table_full_name").alias("target_table"),
+        F.col("target_column_name").alias("target_column"),
+        F.col("event_time"),
+    )
+    .orderBy("target_column", F.col("event_time").desc())
+)
+
+display(col_upstream_df)
 
 # COMMAND ----------
 
-# MAGIC %sql
-# MAGIC -- Column-level downstream impact: where does a source column flow?
-# MAGIC SELECT
-# MAGIC   target_table_full_name AS target_table,
-# MAGIC   target_column_name AS target_column,
-# MAGIC   source_table_full_name AS source_table,
-# MAGIC   source_column_name AS source_column,
-# MAGIC   event_time
-# MAGIC FROM system.access.column_lineage
-# MAGIC WHERE source_table_full_name = '${target_table}'
-# MAGIC   AND (
-# MAGIC     '${target_column}' = ''
-# MAGIC     OR source_column_name = '${target_column}'
-# MAGIC   )
-# MAGIC   AND event_time >= CURRENT_TIMESTAMP() - INTERVAL ${LOOKBACK_DAYS} DAYS
-# MAGIC ORDER BY target_table, target_column_name, event_time DESC
+# Column-level downstream impact: where does a source column flow?
+col_downstream_df = (
+    column_lineage_df
+    .filter(F.col("source_table_full_name") == TARGET_TABLE)
+    .filter(F.col("event_time") >= F.expr(f"CURRENT_TIMESTAMP() - INTERVAL {LOOKBACK_DAYS} DAYS"))
+)
+
+# Apply optional column filter
+if TARGET_COLUMN:
+    col_downstream_df = col_downstream_df.filter(F.col("source_column_name") == TARGET_COLUMN)
+
+col_downstream_df = (
+    col_downstream_df
+    .select(
+        F.col("target_table_full_name").alias("target_table"),
+        F.col("target_column_name").alias("target_column"),
+        F.col("source_table_full_name").alias("source_table"),
+        F.col("source_column_name").alias("source_column"),
+        F.col("event_time"),
+    )
+    .orderBy("target_table", "target_column", F.col("event_time").desc())
+)
+
+display(col_downstream_df)
 
 # COMMAND ----------
 
